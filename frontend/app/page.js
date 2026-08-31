@@ -11,8 +11,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { streamChat, getHealth, API_BASE_URL } from "@/lib/api";
 import { useSpeech } from "@/lib/useSpeech";
+import { useSessions } from "@/lib/useSessions";
 
-const STORAGE_KEY = "aas.conversation.v1";
 const SETTINGS_KEY = "aas.settings.v1";
 
 // Break a block of text into sentence-sized chunks for the synced queue.
@@ -87,19 +87,23 @@ function loadSettings() {
   }
 }
 
-function loadMessages() {
-  if (typeof window === "undefined") return [];
-  try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]") || [];
-  } catch {
-    return [];
-  }
-}
-
 export default function Home() {
-  // Lazy initializers hydrate from localStorage without a setState-in-effect.
-  const [messages, setMessages] = useState(loadMessages);
+  // Multiple conversations, persisted. `messages`/`setMessages` operate on the
+  // currently-active session.
+  const {
+    sessions,
+    activeId,
+    activeMessages: messages,
+    setActiveMessages: setMessages,
+    createSession,
+    switchSession,
+    renameSession,
+    deleteSession,
+    clearActive,
+  } = useSessions();
+
   const [input, setInput] = useState("");
+  const [showSessions, setShowSessions] = useState(false);
   const [busy, setBusy] = useState(false);
   const [health, setHealth] = useState(null);
   const [error, setError] = useState("");
@@ -129,15 +133,7 @@ export default function Home() {
     webSearchRef.current = webSearch;
   }, [webSearch]);
 
-  // --- Persistence: save whenever things change -------------------------
-  useEffect(() => {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(messages.slice(-100)));
-    } catch {
-      /* ignore quota errors */
-    }
-  }, [messages]);
-
+  // Settings persistence (conversations are persisted by useSessions).
   useEffect(() => {
     try {
       localStorage.setItem(
@@ -149,14 +145,21 @@ export default function Home() {
     }
   }, [voiceReplies, langCode, webSearch]);
 
-  const appendToAssistant = useCallback((text) => {
-    setMessages((prev) => {
-      const next = [...prev];
-      const last = next[next.length - 1];
-      next[next.length - 1] = { ...last, role: "assistant", content: last.content + text };
-      return next;
-    });
-  }, []);
+  const appendToAssistant = useCallback(
+    (text) => {
+      setMessages((prev) => {
+        const next = [...prev];
+        const last = next[next.length - 1];
+        next[next.length - 1] = {
+          ...last,
+          role: "assistant",
+          content: last.content + text,
+        };
+        return next;
+      });
+    },
+    [setMessages]
+  );
 
   // --- Stop the current reply -------------------------------------------
   const stopEverything = useCallback(() => {
@@ -264,8 +267,9 @@ export default function Home() {
       let fullReply = "";
       let unspokenLen = 0;
       let sawFirst = false;
+      let citations = [];
       try {
-        await streamChat(
+        const result = await streamChat(
           text,
           history,
           (chunk) => {
@@ -294,6 +298,7 @@ export default function Home() {
           },
           chatOpts
         );
+        citations = result?.citations || [];
 
         if (speakOn && !stoppedRef.current) {
           const tail = fullReply.slice(unspokenLen).trim();
@@ -302,6 +307,18 @@ export default function Home() {
           refreshMoreComing();
           runQueue();
           if (queue.length > 0 || queueRunning) await allSpoken;
+        }
+
+        // Attach any web-search citations to the finished assistant message.
+        if (citations.length && !stoppedRef.current) {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant") {
+              next[next.length - 1] = { ...last, citations };
+            }
+            return next;
+          });
         }
       } catch (err) {
         // A user-initiated abort is not an error — just stop quietly.
@@ -335,7 +352,7 @@ export default function Home() {
         setMoreComing(false);
       }
     },
-    [busy, appendToAssistant]
+    [busy, appendToAssistant, setMessages]
   );
 
   // --- Voice (mic + speaker) --------------------------------------------
@@ -387,13 +404,15 @@ export default function Home() {
 
   function clearConversation() {
     stopEverything();
-    setMessages([]);
+    clearActive();
     setError("");
-    try {
-      localStorage.removeItem(STORAGE_KEY);
-    } catch {
-      /* ignore */
-    }
+  }
+
+  function newChat() {
+    stopEverything();
+    createSession();
+    setError("");
+    setShowSessions(false);
   }
 
   const modelReady = health?.ollama?.model_present;
@@ -455,9 +474,23 @@ export default function Home() {
                 {voiceReplies ? "🔊 Voice on" : "🔇 Voice off"}
               </button>
               <button
+                onClick={() => setShowSessions((v) => !v)}
+                title="Your conversations"
+                className="rounded-full border border-black/[.12] px-3 py-1.5 text-sm dark:border-white/[.15]"
+              >
+                💬 Chats ({sessions.length})
+              </button>
+              <button
+                onClick={newChat}
+                title="Start a new conversation"
+                className="rounded-full border border-black/[.12] px-3 py-1.5 text-sm dark:border-white/[.15]"
+              >
+                ＋ New
+              </button>
+              <button
                 onClick={clearConversation}
                 disabled={messages.length === 0 && !busy}
-                title="Clear conversation"
+                title="Clear this conversation"
                 className="rounded-full border border-black/[.12] px-3 py-1.5 text-sm disabled:opacity-40 dark:border-white/[.15]"
               >
                 🗑 Clear
@@ -465,6 +498,23 @@ export default function Home() {
             </div>
           </div>
         </header>
+
+        {/* Sessions panel */}
+        {showSessions && (
+          <SessionsPanel
+            sessions={sessions}
+            activeId={activeId}
+            onSwitch={(id) => {
+              stopEverything();
+              switchSession(id);
+              setShowSessions(false);
+            }}
+            onRename={renameSession}
+            onDelete={deleteSession}
+            onNew={newChat}
+            onClose={() => setShowSessions(false)}
+          />
+        )}
 
         {/* Mixed-content warning (deployed HTTPS site can't call an HTTP API) */}
         {mixedContent && (
@@ -501,6 +551,7 @@ export default function Home() {
                 role={m.role}
                 content={m.content}
                 ts={m.ts}
+                citations={m.citations}
                 moreComing={isLastAssistant && moreComing}
                 streaming={isLastAssistant && phase === "streaming"}
               />
@@ -604,7 +655,7 @@ function formatTime(ts) {
   }
 }
 
-function Bubble({ role, content, ghost, moreComing, streaming, ts }) {
+function Bubble({ role, content, ghost, moreComing, streaming, ts, citations }) {
   const isUser = role === "user";
   const [copied, setCopied] = useState(false);
 
@@ -645,6 +696,27 @@ function Bubble({ role, content, ghost, moreComing, streaming, ts }) {
             <span className="dot" />
           </span>
         )}
+        {/* Web-search sources under the answer. */}
+        {citations && citations.length > 0 && (
+          <div className="mt-2 border-t border-black/10 pt-2 text-xs dark:border-white/10">
+            <div className="mb-1 font-medium opacity-70">Sources</div>
+            <ol className="space-y-0.5">
+              {citations.map((c) => (
+                <li key={c.n} className="truncate">
+                  <span className="opacity-60">[{c.n}]</span>{" "}
+                  <a
+                    href={c.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="underline decoration-dotted hover:opacity-80"
+                  >
+                    {c.title || c.url}
+                  </a>
+                </li>
+              ))}
+            </ol>
+          </div>
+        )}
       </div>
       {/* Meta row: timestamp + copy (copy only for real, non-ghost content). */}
       {!ghost && content && (
@@ -674,6 +746,66 @@ function ThinkingBubble({ webSearch }) {
         </span>
         {webSearch && <span className="text-xs">searching the web…</span>}
       </div>
+    </div>
+  );
+}
+
+function SessionsPanel({ sessions, activeId, onSwitch, onRename, onDelete, onNew, onClose }) {
+  return (
+    <div className="mb-3 rounded-xl border border-black/[.08] bg-white p-3 dark:border-white/[.12] dark:bg-zinc-950">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-sm font-medium">Your conversations</span>
+        <div className="flex gap-2">
+          <button
+            onClick={onNew}
+            className="rounded-full bg-black px-3 py-1 text-xs text-white dark:bg-white dark:text-black"
+          >
+            ＋ New chat
+          </button>
+          <button onClick={onClose} className="rounded-full px-2 text-sm opacity-60">
+            ✕
+          </button>
+        </div>
+      </div>
+      <ul className="max-h-56 space-y-1 overflow-y-auto">
+        {sessions.map((s) => (
+          <li
+            key={s.id}
+            className={`flex items-center gap-2 rounded-lg px-2 py-1.5 text-sm ${
+              s.id === activeId
+                ? "bg-zinc-100 dark:bg-zinc-800"
+                : "hover:bg-zinc-50 dark:hover:bg-zinc-900"
+            }`}
+          >
+            <button
+              onClick={() => onSwitch(s.id)}
+              className="flex-1 truncate text-left"
+              title={s.title}
+            >
+              {s.title || "Untitled"}
+            </button>
+            <button
+              onClick={() => {
+                const t = prompt("Rename conversation", s.title);
+                if (t !== null) onRename(s.id, t);
+              }}
+              className="text-xs opacity-50 hover:opacity-100"
+              title="Rename"
+            >
+              ✏️
+            </button>
+            <button
+              onClick={() => {
+                if (confirm("Delete this conversation?")) onDelete(s.id);
+              }}
+              className="text-xs opacity-50 hover:opacity-100"
+              title="Delete"
+            >
+              🗑
+            </button>
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

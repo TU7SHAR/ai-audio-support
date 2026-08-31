@@ -134,3 +134,84 @@ def test_web_search_skipped_without_key(monkeypatch):
     r = client.post("/chat", json={"message": "hi", "web_search": True})
     assert r.status_code == 200
     assert r.json()["used_web_search"] is False
+
+
+@respx.mock
+def test_chat_returns_citations(monkeypatch):
+    monkeypatch.setattr(settings, "brave_api_key", "test-key")
+    respx.get(settings.brave_endpoint).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "web": {
+                    "results": [
+                        {
+                            "title": "Puma page",
+                            "url": "https://puma.com/x",
+                            "description": "Details.",
+                            "extra_snippets": ["More detail one.", "More detail two."],
+                        }
+                    ]
+                }
+            },
+        )
+    )
+    respx.post(f"{settings.ollama_base_url}/api/chat").mock(
+        return_value=httpx.Response(
+            200, json={"message": {"content": "Answer [1]."}}
+        )
+    )
+    r = client.post("/chat", json={"message": "puma", "web_search": True})
+    body = r.json()
+    assert body["used_web_search"] is True
+    assert body["citations"] == [{"n": 1, "title": "Puma page", "url": "https://puma.com/x"}]
+
+
+@respx.mock
+def test_history_is_trimmed(monkeypatch):
+    # Force a tiny budget so trimming clearly happens.
+    monkeypatch.setattr(settings, "max_history_turns", 2)
+    captured = {}
+
+    def _capture(request):
+        captured["body"] = request.content.decode()
+        return httpx.Response(200, json={"message": {"content": "ok"}})
+
+    respx.post(f"{settings.ollama_base_url}/api/chat").mock(side_effect=_capture)
+
+    history = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    r = client.post("/chat", json={"message": "now", "history": history})
+    assert r.status_code == 200
+    body = json.loads(captured["body"])
+    # system + 2 trimmed history turns + current user message = 4
+    assert len(body["messages"]) == 4
+    # Oldest turns ("one", "two") should have been dropped.
+    contents = [m["content"] for m in body["messages"]]
+    assert "one" not in contents
+    assert "four" in contents
+
+
+@respx.mock
+def test_chat_stream_sets_citation_headers(monkeypatch):
+    monkeypatch.setattr(settings, "brave_api_key", "test-key")
+    respx.get(settings.brave_endpoint).mock(
+        return_value=httpx.Response(
+            200,
+            json={"web": {"results": [{"title": "T", "url": "https://a.com", "description": "d"}]}},
+        )
+    )
+    respx.post(f"{settings.ollama_base_url}/api/chat").mock(
+        return_value=httpx.Response(
+            200, text=json.dumps({"message": {"content": "hi"}, "done": True})
+        )
+    )
+    with client.stream("POST", "/chat/stream", json={"message": "q", "web_search": True}) as resp:
+        assert resp.headers.get("x-used-web-search") == "1"
+        cites = json.loads(resp.headers.get("x-citations"))
+        assert cites[0]["url"] == "https://a.com"
+        _ = "".join(resp.iter_text())
