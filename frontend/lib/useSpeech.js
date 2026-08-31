@@ -6,14 +6,18 @@
 //   - SpeechRecognition  -> turns the user's speech into text
 //   - speechSynthesis     -> speaks the assistant's replies out loud
 //
-// Mobile notes (why this file is more careful than a desktop-only version):
-//   - Mobile browsers (esp. iOS Safari, Android Chrome) require speech to be
-//     "unlocked" by a real user tap before any speak() will produce sound. We
-//     do that in `primeSpeech()`, called from the mic button's tap handler.
-//   - We also wait for voices to load and pick an explicit English voice,
-//     because on mobile the default voice is often empty on the first call.
-//   - The mic requires a secure context (https:// or localhost). Vercel is
-//     https, so it's fine there.
+// Language:
+//   - Pass `language` (a BCP-47 tag like "hi-IN", "pa-IN", "en-US").
+//   - "auto" (or empty) uses the browser default for recognition and lets TTS
+//     pick a voice matching the text's language.
+//   - Real-world support for non-English (esp. Punjabi) varies by device: the
+//     phone/desktop must actually have that STT engine and TTS voice installed.
+//     We degrade gracefully (fall back to an available voice) rather than break.
+//
+// Mobile notes:
+//   - Mobile browsers require speech to be "unlocked" by a real user tap before
+//     any speak() will produce sound. `primeSpeech()` does that from the mic tap.
+//   - Voices load asynchronously; we wait for them and re-pick when they arrive.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -23,11 +27,25 @@ function getRecognition() {
   return Ctor ? new Ctor() : null;
 }
 
-// Pick a sensible English voice once the browser has loaded its voice list.
-function pickEnglishVoice() {
+// Pick the best available voice for a language tag, falling back sensibly.
+function pickVoiceForLang(langTag) {
   if (typeof window === "undefined" || !window.speechSynthesis) return null;
   const voices = window.speechSynthesis.getVoices();
   if (!voices || voices.length === 0) return null;
+
+  const tag = (langTag || "").toLowerCase();
+  const base = tag.split("-")[0];
+
+  if (base) {
+    // Exact tag match first (e.g. "hi-in"), then language match (e.g. "hi").
+    const exact = voices.find((v) => v.lang && v.lang.toLowerCase() === tag);
+    if (exact) return exact;
+    const byLang = voices.find(
+      (v) => v.lang && v.lang.toLowerCase().split("-")[0] === base
+    );
+    if (byLang) return byLang;
+  }
+  // Fall back to English, then whatever exists.
   return (
     voices.find((v) => v.lang === "en-US") ||
     voices.find((v) => v.lang && v.lang.startsWith("en")) ||
@@ -35,7 +53,7 @@ function pickEnglishVoice() {
   );
 }
 
-export function useSpeech({ onFinalTranscript } = {}) {
+export function useSpeech({ onFinalTranscript, language } = {}) {
   const [listening, setListening] = useState(false);
   const [speaking, setSpeaking] = useState(false);
   const [interim, setInterim] = useState(""); // live, not-yet-final words
@@ -48,8 +66,17 @@ export function useSpeech({ onFinalTranscript } = {}) {
   });
 
   const recognitionRef = useRef(null);
-  const voiceRef = useRef(null); // chosen English voice
   const primedRef = useRef(false); // has speech been unlocked by a user tap?
+
+  // Keep the latest language in a ref so handlers use the current value.
+  const langRef = useRef(language);
+  useEffect(() => {
+    langRef.current = language;
+    // Keep recognition's language in sync when the user changes it.
+    if (recognitionRef.current && language && language !== "auto") {
+      recognitionRef.current.lang = language;
+    }
+  }, [language]);
 
   // Keep the latest callback in a ref so the recognition handlers always call
   // the current version without us having to re-create the recognition object.
@@ -58,25 +85,12 @@ export function useSpeech({ onFinalTranscript } = {}) {
     onFinalRef.current = onFinalTranscript;
   }, [onFinalTranscript]);
 
-  // --- load TTS voices (they arrive asynchronously) ----------------------
-  useEffect(() => {
-    if (typeof window === "undefined" || !window.speechSynthesis) return;
-    const load = () => {
-      voiceRef.current = pickEnglishVoice();
-    };
-    load();
-    window.speechSynthesis.onvoiceschanged = load;
-    return () => {
-      if (window.speechSynthesis) window.speechSynthesis.onvoiceschanged = null;
-    };
-  }, []);
-
   // --- set up SpeechRecognition once ------------------------------------
   useEffect(() => {
     const recognition = getRecognition();
     if (!recognition) return;
 
-    recognition.lang = "en-US";
+    recognition.lang = language && language !== "auto" ? language : "en-US";
     recognition.interimResults = true; // show words as they're spoken
     recognition.continuous = false; // stop automatically after a pause
 
@@ -112,11 +126,11 @@ export function useSpeech({ onFinalTranscript } = {}) {
         /* ignore */
       }
     };
+    // Only set up once; language changes are handled by the effect above.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // --- unlock speech on a real user gesture (critical for mobile) --------
-  // Speaks an inaudible utterance so the browser marks speech as user-approved.
-  // Call this from inside a tap/click handler (we call it on the mic button).
   const primeSpeech = useCallback(() => {
     if (typeof window === "undefined" || !window.speechSynthesis) return;
     if (primedRef.current) return;
@@ -125,8 +139,6 @@ export function useSpeech({ onFinalTranscript } = {}) {
       u.volume = 0; // silent primer
       window.speechSynthesis.speak(u);
       primedRef.current = true;
-      // Voices may only populate after this first call on some browsers.
-      if (!voiceRef.current) voiceRef.current = pickEnglishVoice();
     } catch {
       /* ignore */
     }
@@ -136,6 +148,10 @@ export function useSpeech({ onFinalTranscript } = {}) {
   const startListening = useCallback(() => {
     const recognition = recognitionRef.current;
     if (!recognition || listening) return;
+    // Apply the current language right before starting.
+    if (langRef.current && langRef.current !== "auto") {
+      recognition.lang = langRef.current;
+    }
     // Unlock TTS while we still have the user's tap gesture.
     primeSpeech();
     // Don't listen to ourselves talking.
@@ -161,9 +177,8 @@ export function useSpeech({ onFinalTranscript } = {}) {
   }, []);
 
   // --- text-to-speech ----------------------------------------------------
-  // Optional callbacks let the caller sync the UI with speech:
-  //   speak(text, { onStart, onEnd })
-  const speak = useCallback((text, { onStart, onEnd } = {}) => {
+  // speak(text, { onStart, onEnd, lang })
+  const speak = useCallback((text, { onStart, onEnd, lang } = {}) => {
     if (typeof window === "undefined" || !("speechSynthesis" in window)) {
       onEnd?.();
       return;
@@ -183,10 +198,11 @@ export function useSpeech({ onFinalTranscript } = {}) {
       }
     }
 
+    const wantLang = lang || (langRef.current !== "auto" ? langRef.current : "");
     const utterance = new SpeechSynthesisUtterance(text.trim());
-    const voice = voiceRef.current || pickEnglishVoice();
+    const voice = pickVoiceForLang(wantLang);
     if (voice) utterance.voice = voice;
-    utterance.lang = voice?.lang || "en-US";
+    utterance.lang = wantLang || voice?.lang || "en-US";
     utterance.rate = 1.0;
     utterance.volume = 1.0;
     utterance.onstart = () => {

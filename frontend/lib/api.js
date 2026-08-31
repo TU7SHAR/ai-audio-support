@@ -16,13 +16,19 @@ export const API_BASE_URL =
  * Send a message and get the full reply back (waits for completion).
  * @param {string} message
  * @param {Array<{role: string, content: string}>} history
+ * @param {{ language?: string, webSearch?: boolean }} [opts]
  * @returns {Promise<string>} the assistant's reply text
  */
-export async function sendChat(message, history = []) {
+export async function sendChat(message, history = [], opts = {}) {
   const res = await fetch(`${API_BASE_URL}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, history }),
+    body: JSON.stringify({
+      message,
+      history,
+      language: opts.language || null,
+      web_search: !!opts.webSearch,
+    }),
   });
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
@@ -34,17 +40,22 @@ export async function sendChat(message, history = []) {
 
 /**
  * Stream a reply, calling onChunk for each piece of text as it arrives.
- * This is what we'll use for the real-time voice experience later.
  * @param {string} message
  * @param {Array<{role: string, content: string}>} history
  * @param {(chunk: string) => void} onChunk
+ * @param {{ language?: string, webSearch?: boolean }} [opts]
  * @returns {Promise<string>} the full reply once complete
  */
-export async function streamChat(message, history = [], onChunk) {
+export async function streamChat(message, history = [], onChunk, opts = {}) {
   const res = await fetch(`${API_BASE_URL}/chat/stream`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ message, history }),
+    body: JSON.stringify({
+      message,
+      history,
+      language: opts.language || null,
+      web_search: !!opts.webSearch,
+    }),
   });
   if (!res.ok || !res.body) {
     const detail = await res.text().catch(() => "");

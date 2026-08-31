@@ -22,22 +22,42 @@ class Settings(BaseSettings):
     ollama_timeout: float = 120.0
 
     # --- Model behaviour ---------------------------------------------------
-    # The "personality" and rules for the support agent. Keep it short and
-    # firm so a small model stays on task.
+    # The "personality" and rules for the support agent. Kept firm so a small
+    # model stays on task, replies in the user's language, and does NOT invent
+    # facts (it should say it doesn't know instead of hallucinating).
     system_prompt: str = (
         "You are a helpful, concise customer support voice assistant. "
-        "Always reply in clear English. Keep answers short and conversational, "
-        "as if speaking on a phone call. Avoid long lists unless asked. "
-        "If you do not know something, say so briefly and offer to help another way."
+        "Reply in the SAME language the user used (e.g. English, Hindi, Punjabi). "
+        "Keep answers short and conversational, as if speaking on a phone call. "
+        "Avoid long lists unless asked. "
+        "Do NOT invent facts, product details, or prices. If you are not sure, "
+        "say you do not have that information and offer to help another way. "
+        "When you are given SEARCH RESULTS, base your answer on them and briefly "
+        "mention that the info comes from a web search."
     )
 
     # Sampling temperature: lower = more focused/consistent answers.
     temperature: float = 0.4
 
+    # --- Web search (Brave Search API) ------------------------------------
+    # Optional. If a key is set, the /chat endpoints can fetch live web results
+    # and feed them to the model. Get a free key at:
+    #   https://api-dashboard.search.brave.com/
+    # Leave blank to disable web search (the app still works without it).
+    brave_api_key: str = ""
+    brave_endpoint: str = "https://api.search.brave.com/res/v1/web/search"
+    # How many search results to feed into the prompt.
+    search_results_count: int = 4
+    search_timeout: float = 15.0
+
     # --- CORS --------------------------------------------------------------
     # Comma-separated list of allowed browser origins (your Vercel URL, etc).
     # Use "*" only for local testing.
     cors_origins: str = "*"
+
+    @property
+    def web_search_enabled(self) -> bool:
+        return bool(self.brave_api_key.strip())
 
 
 settings = Settings()
