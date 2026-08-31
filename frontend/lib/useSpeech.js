@@ -161,9 +161,17 @@ export function useSpeech({ onFinalTranscript } = {}) {
   }, []);
 
   // --- text-to-speech ----------------------------------------------------
-  const speak = useCallback((text) => {
-    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
-    if (!text || !text.trim()) return;
+  // Optional callbacks let the caller sync the UI with speech:
+  //   speak(text, { onStart, onEnd })
+  const speak = useCallback((text, { onStart, onEnd } = {}) => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) {
+      onEnd?.();
+      return;
+    }
+    if (!text || !text.trim()) {
+      onEnd?.();
+      return;
+    }
 
     const synth = window.speechSynthesis;
     // Mobile browsers sometimes "pause" the queue; nudge it back to life.
@@ -181,9 +189,18 @@ export function useSpeech({ onFinalTranscript } = {}) {
     utterance.lang = voice?.lang || "en-US";
     utterance.rate = 1.0;
     utterance.volume = 1.0;
-    utterance.onstart = () => setSpeaking(true);
-    utterance.onend = () => setSpeaking(false);
-    utterance.onerror = () => setSpeaking(false);
+    utterance.onstart = () => {
+      setSpeaking(true);
+      onStart?.();
+    };
+    utterance.onend = () => {
+      setSpeaking(false);
+      onEnd?.();
+    };
+    utterance.onerror = () => {
+      setSpeaking(false);
+      onEnd?.();
+    };
     synth.speak(utterance);
   }, []);
 

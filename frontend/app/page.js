@@ -13,26 +13,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { streamChat, getHealth } from "@/lib/api";
 import { useSpeech } from "@/lib/useSpeech";
 
-// Speak any complete sentence(s) from the growing reply, advancing `cursorRef`
-// past what we've already spoken. This lets the assistant start talking while
-// the rest of the answer is still streaming in (real-time feel).
-function speakNewSentences(full, cursorRef, speak) {
-  const pending = full.slice(cursorRef.current);
-  const match = pending.match(/^[\s\S]*[.!?]/);
-  if (match) {
-    const chunk = match[0].trim();
-    if (chunk) speak(chunk);
-    cursorRef.current += match[0].length;
-  }
-}
-
-// Speak any trailing text that didn't end with sentence punctuation.
-function speakRemainder(full, cursorRef, speak) {
-  const pending = full.slice(cursorRef.current).trim();
-  if (pending) {
-    speak(pending);
-    cursorRef.current = full.length;
-  }
+// Break a block of text into sentence-sized chunks for the synced queue.
+// Splits after . ! ? (keeping the punctuation). Any trailing text without
+// ending punctuation comes back as its own chunk.
+function splitIntoSentences(text) {
+  const matches = text.match(/[^.!?]+[.!?]+|\S[^.!?]*$/g);
+  return matches ? matches.map((s) => s.trim()).filter(Boolean) : [];
 }
 
 export default function Home() {
@@ -44,12 +30,23 @@ export default function Home() {
   const [voiceReplies, setVoiceReplies] = useState(true); // speak answers aloud
   const scrollRef = useRef(null);
 
-  // Tracks how much of the current reply we've already spoken, so we can speak
-  // it sentence-by-sentence as it streams instead of waiting for the whole thing.
-  const spokenUpToRef = useRef(0);
-  // Holds the latest `speak` fn from the hook so submitMessage can call it
-  // without depending on hook ordering.
+  // Holds the latest hook fns so submitMessage can use them without depending
+  // on hook declaration order.
   const speakRef = useRef(() => {});
+  const voiceRepliesRef = useRef(voiceReplies);
+  useEffect(() => {
+    voiceRepliesRef.current = voiceReplies;
+  }, [voiceReplies]);
+
+  // Append text to the current (last) assistant bubble.
+  const appendToAssistant = useCallback((text) => {
+    setMessages((prev) => {
+      const next = [...prev];
+      const last = next[next.length - 1];
+      next[next.length - 1] = { role: "assistant", content: last.content + text };
+      return next;
+    });
+  }, []);
 
   // --- Core send logic (shared by mic and text) --------------------------
   const submitMessage = useCallback(
@@ -60,7 +57,6 @@ export default function Home() {
       setError("");
       setInput("");
       setBusy(true);
-      spokenUpToRef.current = 0;
 
       // Snapshot history BEFORE adding the new turn.
       let history;
@@ -73,21 +69,85 @@ export default function Home() {
         ];
       });
 
+      const speakOn = voiceRepliesRef.current;
+
+      // A queue of sentences waiting to be spoken + revealed in sync.
+      const queue = [];
+      let queueRunning = false;
+      let streamDone = false;
+      let sentenceIndex = 0;
+      let resolveWhenDone;
+      const allSpoken = new Promise((res) => (resolveWhenDone = res));
+
+      // Reveal a sentence's text in the bubble at the same moment we speak it,
+      // then wait for speech to finish before moving to the next one. This is
+      // what keeps the on-screen text in sync with the voice.
+      function runQueue() {
+        if (queueRunning) return;
+        queueRunning = true;
+
+        const step = () => {
+          if (queue.length === 0) {
+            queueRunning = false;
+            if (streamDone) resolveWhenDone?.();
+            return;
+          }
+          const sentence = queue.shift();
+          const prefix = sentenceIndex === 0 ? "" : " ";
+          sentenceIndex += 1;
+          let revealed = false;
+          const reveal = () => {
+            if (revealed) return;
+            revealed = true;
+            appendToAssistant(prefix + sentence);
+          };
+          speakRef.current(sentence, {
+            // Reveal the words right as speaking starts, so text tracks voice.
+            onStart: reveal,
+            // Safety net: if speech can't start (unsupported), still show text
+            // and move on.
+            onEnd: () => {
+              reveal();
+              step();
+            },
+          });
+        };
+        step();
+      }
+
       let fullReply = "";
+      let unspokenLen = 0; // chars already pushed into the queue
       try {
         await streamChat(text, history, (chunk) => {
           fullReply += chunk;
-          // Update the assistant bubble live.
-          setMessages((prev) => {
-            const next = [...prev];
-            next[next.length - 1] = { role: "assistant", content: fullReply };
-            return next;
-          });
-          // Speak any newly-completed sentence(s) as they arrive.
-          if (voiceReplies) speakNewSentences(fullReply, spokenUpToRef, speakRef.current);
+
+          if (!speakOn) {
+            // Voice off: stream text straight to the bubble (fast path).
+            appendToAssistant(chunk);
+            return;
+          }
+
+          // Voice on: hold text back; enqueue only fully-completed sentences.
+          const pending = fullReply.slice(unspokenLen);
+          const match = pending.match(/^[\s\S]*[.!?]/); // up to last sentence end
+          if (match) {
+            const completed = match[0];
+            const sentences = splitIntoSentences(completed);
+            sentences.forEach((s) => queue.push(s));
+            unspokenLen += completed.length;
+            runQueue();
+          }
         });
-        // Speak any trailing text that didn't end with punctuation.
-        if (voiceReplies) speakRemainder(fullReply, spokenUpToRef, speakRef.current);
+
+        if (speakOn) {
+          // Flush any trailing text with no ending punctuation.
+          const tail = fullReply.slice(unspokenLen).trim();
+          if (tail) queue.push(tail);
+          streamDone = true;
+          runQueue();
+          // Wait until every queued sentence has been spoken+shown.
+          if (queue.length > 0 || queueRunning) await allSpoken;
+        }
       } catch (err) {
         setError(err.message);
         setMessages((prev) => {
@@ -109,7 +169,7 @@ export default function Home() {
         setBusy(false);
       }
     },
-    [busy, voiceReplies]
+    [busy, appendToAssistant]
   );
 
   // --- Voice (mic + speaker) --------------------------------------------
