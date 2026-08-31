@@ -21,6 +21,46 @@ function splitIntoSentences(text) {
   return matches ? matches.map((s) => s.trim()).filter(Boolean) : [];
 }
 
+// Reveal a sentence word-by-word over roughly the time it takes to speak it,
+// so the on-screen text flows in sync with the voice instead of popping in all
+// at once. Returns a cancel function.
+function streamWords(sentence, appendChunk, done, { totalMs } = {}) {
+  const words = sentence.split(/(\s+)/); // keep whitespace tokens
+  const realWords = words.filter((w) => w.trim()).length || 1;
+  // Estimate speaking time (~340ms/word) unless the caller knows better.
+  const duration = totalMs || realWords * 340;
+  const perToken = Math.max(30, duration / words.length);
+  let i = 0;
+  let timer = null;
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    if (timer) clearTimeout(timer);
+    done?.();
+  };
+  const tick = () => {
+    if (i >= words.length) {
+      finish();
+      return;
+    }
+    appendChunk(words[i]);
+    i += 1;
+    timer = setTimeout(tick, perToken);
+  };
+  tick();
+  // Cancel = flush any not-yet-revealed words immediately, then finish. This
+  // guarantees the full sentence is shown even if speech ends early.
+  return () => {
+    if (timer) clearTimeout(timer);
+    while (i < words.length) {
+      appendChunk(words[i]);
+      i += 1;
+    }
+    finish();
+  };
+}
+
 export default function Home() {
   const [messages, setMessages] = useState([]); // {role, content}
   const [input, setInput] = useState("");
@@ -28,6 +68,13 @@ export default function Home() {
   const [health, setHealth] = useState(null);
   const [error, setError] = useState("");
   const [voiceReplies, setVoiceReplies] = useState(true); // speak answers aloud
+  // Drives the animations:
+  //   "idle"      – nothing happening
+  //   "thinking"  – request sent, waiting for the first words
+  //   "streaming" – actively revealing/speaking the reply
+  const [phase, setPhase] = useState("idle");
+  // True while there are still queued sentences waiting to be spoken/shown.
+  const [moreComing, setMoreComing] = useState(false);
   const scrollRef = useRef(null);
 
   // Holds the latest hook fns so submitMessage can use them without depending
@@ -57,6 +104,8 @@ export default function Home() {
       setError("");
       setInput("");
       setBusy(true);
+      setPhase("thinking"); // show the "thinking…" animation until first words
+      setMoreComing(false);
 
       // Snapshot history BEFORE adding the new turn.
       let history;
@@ -79,9 +128,13 @@ export default function Home() {
       let resolveWhenDone;
       const allSpoken = new Promise((res) => (resolveWhenDone = res));
 
-      // Reveal a sentence's text in the bubble at the same moment we speak it,
-      // then wait for speech to finish before moving to the next one. This is
-      // what keeps the on-screen text in sync with the voice.
+      // Reflect whether there's still buffered content the user hasn't seen yet.
+      const refreshMoreComing = () => {
+        setMoreComing(queue.length > 0);
+      };
+
+      // For each sentence: speak it, and reveal its words gradually across the
+      // spoken duration so text and voice move together.
       function runQueue() {
         if (queueRunning) return;
         queueRunning = true;
@@ -89,40 +142,62 @@ export default function Home() {
         const step = () => {
           if (queue.length === 0) {
             queueRunning = false;
+            setMoreComing(false);
             if (streamDone) resolveWhenDone?.();
             return;
           }
           const sentence = queue.shift();
+          refreshMoreComing();
           const prefix = sentenceIndex === 0 ? "" : " ";
           sentenceIndex += 1;
-          let revealed = false;
-          const reveal = () => {
-            if (revealed) return;
-            revealed = true;
-            appendToAssistant(prefix + sentence);
+          if (prefix) appendToAssistant(prefix);
+
+          let cancelStream = null;
+          let advanced = false;
+          const advance = () => {
+            if (advanced) return;
+            advanced = true;
+            step();
           };
+
+          setPhase("streaming");
           speakRef.current(sentence, {
-            // Reveal the words right as speaking starts, so text tracks voice.
-            onStart: reveal,
-            // Safety net: if speech can't start (unsupported), still show text
-            // and move on.
+            onStart: () => {
+              // Word-by-word reveal timed to the spoken sentence.
+              cancelStream = streamWords(sentence, appendToAssistant, () => {});
+            },
             onEnd: () => {
-              reveal();
-              step();
+              // Ensure the full sentence is shown even if timing under/over-ran.
+              if (cancelStream) cancelStream();
+              advance();
             },
           });
+
+          // Safety net: if speech never starts (TTS unsupported), still reveal
+          // the sentence and move on.
+          setTimeout(() => {
+            if (!advanced && !cancelStream) {
+              appendToAssistant(sentence);
+              advance();
+            }
+          }, 1500);
         };
         step();
       }
 
       let fullReply = "";
       let unspokenLen = 0; // chars already pushed into the queue
+      let sawFirst = false;
       try {
         await streamChat(text, history, (chunk) => {
           fullReply += chunk;
 
           if (!speakOn) {
             // Voice off: stream text straight to the bubble (fast path).
+            if (!sawFirst) {
+              sawFirst = true;
+              setPhase("streaming");
+            }
             appendToAssistant(chunk);
             return;
           }
@@ -135,6 +210,8 @@ export default function Home() {
             const sentences = splitIntoSentences(completed);
             sentences.forEach((s) => queue.push(s));
             unspokenLen += completed.length;
+            sawFirst = true;
+            refreshMoreComing();
             runQueue();
           }
         });
@@ -144,6 +221,7 @@ export default function Home() {
           const tail = fullReply.slice(unspokenLen).trim();
           if (tail) queue.push(tail);
           streamDone = true;
+          refreshMoreComing();
           runQueue();
           // Wait until every queued sentence has been spoken+shown.
           if (queue.length > 0 || queueRunning) await allSpoken;
@@ -167,6 +245,8 @@ export default function Home() {
         });
       } finally {
         setBusy(false);
+        setPhase("idle");
+        setMoreComing(false);
       }
     },
     [busy, appendToAssistant]
@@ -259,9 +339,23 @@ export default function Home() {
               🎤 Tap the mic and ask something — or type below.
             </p>
           )}
-          {messages.map((m, i) => (
-            <Bubble key={i} role={m.role} content={m.content} />
-          ))}
+          {messages.map((m, i) => {
+            const isLastAssistant =
+              m.role === "assistant" && i === messages.length - 1;
+            return (
+              <Bubble
+                key={i}
+                role={m.role}
+                content={m.content}
+                // On the active assistant bubble, show a "more coming" hint
+                // and a typing caret while streaming.
+                moreComing={isLastAssistant && moreComing}
+                streaming={isLastAssistant && phase === "streaming"}
+              />
+            );
+          })}
+          {/* "Thinking…" bubble shown before any words arrive. */}
+          {phase === "thinking" && <ThinkingBubble />}
           {/* Live transcription of what the user is saying right now. */}
           {interim && <Bubble role="user" content={interim} ghost />}
         </div>
@@ -280,15 +374,34 @@ export default function Home() {
           >
             {listening ? "⏹" : "🎤"}
           </button>
-          <p className="mt-2 h-5 text-xs text-zinc-500 dark:text-zinc-400">
-            {!supported.stt
-              ? "Mic not supported in this browser — try Chrome/Edge"
-              : listening
-              ? "Listening… tap to stop"
-              : speaking
-              ? "Speaking…"
-              : "Tap to speak"}
-          </p>
+          <div className="mt-2 flex h-5 items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
+            {!supported.stt ? (
+              "Mic not supported in this browser — try Chrome/Edge"
+            ) : listening ? (
+              "Listening… tap to stop"
+            ) : phase === "thinking" ? (
+              <>
+                Thinking
+                <span className="inline-flex gap-1 text-zinc-500 dark:text-zinc-400">
+                  <span className="dot" />
+                  <span className="dot" />
+                  <span className="dot" />
+                </span>
+              </>
+            ) : speaking || phase === "streaming" ? (
+              <>
+                Answering
+                <span className="inline-flex items-end gap-0.5 text-zinc-500 dark:text-zinc-400">
+                  <span className="eq-bar" />
+                  <span className="eq-bar" />
+                  <span className="eq-bar" />
+                  <span className="eq-bar" />
+                </span>
+              </>
+            ) : (
+              "Tap to speak"
+            )}
+          </div>
         </div>
 
         {/* Text input — secondary */}
@@ -320,7 +433,7 @@ export default function Home() {
   );
 }
 
-function Bubble({ role, content, ghost }) {
+function Bubble({ role, content, ghost, moreComing, streaming }) {
   const isUser = role === "user";
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
@@ -331,7 +444,40 @@ function Bubble({ role, content, ghost }) {
             : "bg-zinc-100 text-black dark:bg-zinc-800 dark:text-zinc-100"
         } ${ghost ? "opacity-50 italic" : ""}`}
       >
-        {content || <span className="opacity-40">…</span>}
+        {content ? (
+          <>
+            {content}
+            {/* Blinking caret while text is actively streaming in. */}
+            {streaming && <span className="caret" />}
+          </>
+        ) : (
+          <span className="opacity-40">…</span>
+        )}
+        {/* "More is coming" indicator for the active reply. */}
+        {moreComing && (
+          <span
+            className="ml-2 inline-flex gap-1 align-middle text-zinc-500 dark:text-zinc-400"
+            title="More response coming"
+          >
+            <span className="dot" />
+            <span className="dot" />
+            <span className="dot" />
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// A standalone assistant bubble that shows only the "thinking" animation,
+// used before the first words of the reply arrive.
+function ThinkingBubble() {
+  return (
+    <div className="flex justify-start">
+      <div className="flex items-center gap-1 rounded-2xl bg-zinc-100 px-4 py-3 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+        <span className="dot" />
+        <span className="dot" />
+        <span className="dot" />
       </div>
     </div>
   );
