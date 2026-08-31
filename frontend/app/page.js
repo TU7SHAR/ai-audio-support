@@ -61,6 +61,23 @@ function streamWords(sentence, appendChunk, done, { totalMs } = {}) {
   };
 }
 
+// Languages offered in the picker. `code` is the BCP-47 tag used for the
+// browser mic/voice; `apiLang` is the short code sent to the backend so the
+// model replies in that language. "auto" mirrors whatever the user speaks.
+const LANGUAGES = [
+  { code: "auto", apiLang: null, label: "Auto (detect)" },
+  { code: "en-US", apiLang: "en", label: "English" },
+  { code: "hi-IN", apiLang: "hi", label: "हिन्दी Hindi" },
+  { code: "pa-IN", apiLang: "pa", label: "ਪੰਜਾਬੀ Punjabi" },
+  { code: "bn-IN", apiLang: "bn", label: "বাংলা Bengali" },
+  { code: "ta-IN", apiLang: "ta", label: "தமிழ் Tamil" },
+  { code: "te-IN", apiLang: "te", label: "తెలుగు Telugu" },
+  { code: "mr-IN", apiLang: "mr", label: "मराठी Marathi" },
+  { code: "gu-IN", apiLang: "gu", label: "ગુજરાતી Gujarati" },
+  { code: "es-ES", apiLang: "es", label: "Español Spanish" },
+  { code: "fr-FR", apiLang: "fr", label: "Français French" },
+];
+
 export default function Home() {
   const [messages, setMessages] = useState([]); // {role, content}
   const [input, setInput] = useState("");
@@ -68,6 +85,8 @@ export default function Home() {
   const [health, setHealth] = useState(null);
   const [error, setError] = useState("");
   const [voiceReplies, setVoiceReplies] = useState(true); // speak answers aloud
+  const [langCode, setLangCode] = useState("auto"); // selected BCP-47 tag
+  const [webSearch, setWebSearch] = useState(false); // use live internet
   // Drives the animations:
   //   "idle"      – nothing happening
   //   "thinking"  – request sent, waiting for the first words
@@ -84,6 +103,17 @@ export default function Home() {
   useEffect(() => {
     voiceRepliesRef.current = voiceReplies;
   }, [voiceReplies]);
+
+  // Current language + web-search settings, kept in refs so submitMessage
+  // (a stable callback) always reads the latest values.
+  const langRef = useRef(langCode);
+  const webSearchRef = useRef(webSearch);
+  useEffect(() => {
+    langRef.current = langCode;
+  }, [langCode]);
+  useEffect(() => {
+    webSearchRef.current = webSearch;
+  }, [webSearch]);
 
   // Append text to the current (last) assistant bubble.
   const appendToAssistant = useCallback((text) => {
@@ -119,6 +149,9 @@ export default function Home() {
       });
 
       const speakOn = voiceRepliesRef.current;
+      const selected = LANGUAGES.find((l) => l.code === langRef.current);
+      const apiLang = selected?.apiLang || null;
+      const chatOpts = { language: apiLang, webSearch: webSearchRef.current };
 
       // A queue of sentences waiting to be spoken + revealed in sync.
       const queue = [];
@@ -214,7 +247,7 @@ export default function Home() {
             refreshMoreComing();
             runQueue();
           }
-        });
+        }, chatOpts);
 
         if (speakOn) {
           // Flush any trailing text with no ending punctuation.
@@ -266,6 +299,7 @@ export default function Home() {
   } = useSpeech({
     // When the browser finalizes what the user said, send it.
     onFinalTranscript: (finalText) => submitMessage(finalText),
+    language: langCode,
   });
 
   // Keep the speak ref pointing at the current hook function.
@@ -319,14 +353,46 @@ export default function Home() {
             </p>
             <StatusBadge health={health} error={error} />
           </div>
-          {/* Speaker on/off */}
-          <button
-            onClick={toggleVoiceReplies}
-            title={voiceReplies ? "Voice replies on" : "Voice replies off"}
-            className="mt-1 shrink-0 rounded-full border border-black/[.12] px-3 py-2 text-sm dark:border-white/[.15]"
-          >
-            {voiceReplies ? "🔊 Voice on" : "🔇 Voice off"}
-          </button>
+          {/* Controls: language, web search, voice on/off */}
+          <div className="mt-1 flex shrink-0 flex-col items-end gap-2">
+            <select
+              value={langCode}
+              onChange={(e) => setLangCode(e.target.value)}
+              title="Language"
+              className="rounded-full border border-black/[.12] bg-white px-3 py-1.5 text-sm text-black dark:border-white/[.15] dark:bg-zinc-900 dark:text-white"
+            >
+              {LANGUAGES.map((l) => (
+                <option key={l.code} value={l.code}>
+                  {l.label}
+                </option>
+              ))}
+            </select>
+            <div className="flex gap-2">
+              <button
+                onClick={() => setWebSearch((v) => !v)}
+                disabled={health && !health.web_search_enabled}
+                title={
+                  health && !health.web_search_enabled
+                    ? "Web search not configured on the server (set BRAVE_API_KEY)"
+                    : "Answer using live web search"
+                }
+                className={`rounded-full border px-3 py-1.5 text-sm disabled:opacity-40 ${
+                  webSearch
+                    ? "border-transparent bg-blue-600 text-white"
+                    : "border-black/[.12] dark:border-white/[.15]"
+                }`}
+              >
+                {webSearch ? "🌐 Web on" : "🌐 Web off"}
+              </button>
+              <button
+                onClick={toggleVoiceReplies}
+                title={voiceReplies ? "Voice replies on" : "Voice replies off"}
+                className="rounded-full border border-black/[.12] px-3 py-1.5 text-sm dark:border-white/[.15]"
+              >
+                {voiceReplies ? "🔊 Voice on" : "🔇 Voice off"}
+              </button>
+            </div>
+          </div>
         </header>
 
         {/* Messages */}

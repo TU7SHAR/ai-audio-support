@@ -30,11 +30,29 @@ Request body for `/chat` and `/chat/stream`:
   "history": [
     { "role": "user", "content": "earlier message" },
     { "role": "assistant", "content": "earlier reply" }
-  ]
+  ],
+  "language": "hi",
+  "web_search": true
 }
 ```
 
-`history` is optional — send it to give the model conversation context.
+- `history` (optional) — prior turns for conversation context.
+- `language` (optional) — reply language code (`en`, `hi`, `pa`, `es`, …). Omit
+  or use `auto` to mirror the user's language.
+- `web_search` (optional) — if `true` **and** a Brave API key is configured,
+  the backend fetches live web results and answers from them.
+
+## Web search (live internet)
+
+The model itself can't browse the web. When `web_search` is on, the backend
+queries the **Brave Search API** and feeds the results into the prompt so the
+model answers from real data instead of guessing.
+
+1. Get a free key at https://api-dashboard.search.brave.com/
+2. Put it in `.env`: `BRAVE_API_KEY=your-key-here`
+3. Restart the API. `/health` will then report `"web_search_enabled": true`.
+
+Without a key, web search is simply skipped — everything else still works.
 
 ---
 
