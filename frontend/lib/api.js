@@ -56,6 +56,8 @@ export async function streamChat(message, history = [], onChunk, opts = {}) {
       language: opts.language || null,
       web_search: !!opts.webSearch,
     }),
+    // Lets the caller cancel an in-flight reply (Stop button).
+    signal: opts.signal,
   });
   if (!res.ok || !res.body) {
     const detail = await res.text().catch(() => "");

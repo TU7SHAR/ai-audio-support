@@ -6,28 +6,26 @@
 // appear live in a chat bubble, and the assistant's reply is BOTH streamed into
 // a bubble AND spoken aloud. A text input is kept as a secondary option.
 //
-// Voice uses the browser's built-in Web Speech API (see lib/useSpeech.js) — no
-// extra services and no backend changes.
+// Voice uses the browser's built-in Web Speech API (see lib/useSpeech.js).
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { streamChat, getHealth } from "@/lib/api";
+import { streamChat, getHealth, API_BASE_URL } from "@/lib/api";
 import { useSpeech } from "@/lib/useSpeech";
 
+const STORAGE_KEY = "aas.conversation.v1";
+const SETTINGS_KEY = "aas.settings.v1";
+
 // Break a block of text into sentence-sized chunks for the synced queue.
-// Splits after . ! ? (keeping the punctuation). Any trailing text without
-// ending punctuation comes back as its own chunk.
 function splitIntoSentences(text) {
   const matches = text.match(/[^.!?]+[.!?]+|\S[^.!?]*$/g);
   return matches ? matches.map((s) => s.trim()).filter(Boolean) : [];
 }
 
 // Reveal a sentence word-by-word over roughly the time it takes to speak it,
-// so the on-screen text flows in sync with the voice instead of popping in all
-// at once. Returns a cancel function.
+// so on-screen text flows in sync with the voice. Returns a cancel function.
 function streamWords(sentence, appendChunk, done, { totalMs } = {}) {
-  const words = sentence.split(/(\s+)/); // keep whitespace tokens
+  const words = sentence.split(/(\s+)/);
   const realWords = words.filter((w) => w.trim()).length || 1;
-  // Estimate speaking time (~340ms/word) unless the caller knows better.
   const duration = totalMs || realWords * 340;
   const perToken = Math.max(30, duration / words.length);
   let i = 0;
@@ -49,8 +47,6 @@ function streamWords(sentence, appendChunk, done, { totalMs } = {}) {
     timer = setTimeout(tick, perToken);
   };
   tick();
-  // Cancel = flush any not-yet-revealed words immediately, then finish. This
-  // guarantees the full sentence is shown even if speech ends early.
   return () => {
     if (timer) clearTimeout(timer);
     while (i < words.length) {
@@ -61,9 +57,8 @@ function streamWords(sentence, appendChunk, done, { totalMs } = {}) {
   };
 }
 
-// Languages offered in the picker. `code` is the BCP-47 tag used for the
-// browser mic/voice; `apiLang` is the short code sent to the backend so the
-// model replies in that language. "auto" mirrors whatever the user speaks.
+// Languages offered in the picker. `code` is the BCP-47 tag for the browser
+// mic/voice; `apiLang` is the short code sent to the backend.
 const LANGUAGES = [
   { code: "auto", apiLang: null, label: "Auto (detect)" },
   { code: "en-US", apiLang: "en", label: "English" },
@@ -78,36 +73,55 @@ const LANGUAGES = [
   { code: "fr-FR", apiLang: "fr", label: "Français French" },
 ];
 
+function nowTs() {
+  return Date.now();
+}
+
+// Read persisted settings once (client-side only). SSR returns defaults.
+function loadSettings() {
+  if (typeof window === "undefined") return {};
+  try {
+    return JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+
+function loadMessages() {
+  if (typeof window === "undefined") return [];
+  try {
+    return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]") || [];
+  } catch {
+    return [];
+  }
+}
+
 export default function Home() {
-  const [messages, setMessages] = useState([]); // {role, content}
+  // Lazy initializers hydrate from localStorage without a setState-in-effect.
+  const [messages, setMessages] = useState(loadMessages);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [health, setHealth] = useState(null);
   const [error, setError] = useState("");
-  const [voiceReplies, setVoiceReplies] = useState(true); // speak answers aloud
-  const [langCode, setLangCode] = useState("auto"); // selected BCP-47 tag
-  const [webSearch, setWebSearch] = useState(false); // use live internet
-  // Drives the animations:
-  //   "idle"      – nothing happening
-  //   "thinking"  – request sent, waiting for the first words
-  //   "streaming" – actively revealing/speaking the reply
-  const [phase, setPhase] = useState("idle");
-  // True while there are still queued sentences waiting to be spoken/shown.
+  const [voiceReplies, setVoiceReplies] = useState(
+    () => loadSettings().voiceReplies ?? true
+  );
+  const [langCode, setLangCode] = useState(() => loadSettings().langCode ?? "auto");
+  const [webSearch, setWebSearch] = useState(() => loadSettings().webSearch ?? false);
+  const [phase, setPhase] = useState("idle"); // idle | thinking | streaming
   const [moreComing, setMoreComing] = useState(false);
   const scrollRef = useRef(null);
 
-  // Holds the latest hook fns so submitMessage can use them without depending
-  // on hook declaration order.
-  const speakRef = useRef(() => {});
+  const speakRef = useRef({ speak: () => {}, stop: () => {} });
   const voiceRepliesRef = useRef(voiceReplies);
+  const langRef = useRef(langCode);
+  const webSearchRef = useRef(webSearch);
+  const abortRef = useRef(null); // AbortController for the active request
+  const stoppedRef = useRef(false); // user pressed Stop
+
   useEffect(() => {
     voiceRepliesRef.current = voiceReplies;
   }, [voiceReplies]);
-
-  // Current language + web-search settings, kept in refs so submitMessage
-  // (a stable callback) always reads the latest values.
-  const langRef = useRef(langCode);
-  const webSearchRef = useRef(webSearch);
   useEffect(() => {
     langRef.current = langCode;
   }, [langCode]);
@@ -115,14 +129,47 @@ export default function Home() {
     webSearchRef.current = webSearch;
   }, [webSearch]);
 
-  // Append text to the current (last) assistant bubble.
+  // --- Persistence: save whenever things change -------------------------
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(messages.slice(-100)));
+    } catch {
+      /* ignore quota errors */
+    }
+  }, [messages]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        SETTINGS_KEY,
+        JSON.stringify({ voiceReplies, langCode, webSearch })
+      );
+    } catch {
+      /* ignore */
+    }
+  }, [voiceReplies, langCode, webSearch]);
+
   const appendToAssistant = useCallback((text) => {
     setMessages((prev) => {
       const next = [...prev];
       const last = next[next.length - 1];
-      next[next.length - 1] = { role: "assistant", content: last.content + text };
+      next[next.length - 1] = { ...last, role: "assistant", content: last.content + text };
       return next;
     });
+  }, []);
+
+  // --- Stop the current reply -------------------------------------------
+  const stopEverything = useCallback(() => {
+    stoppedRef.current = true;
+    try {
+      abortRef.current?.abort();
+    } catch {
+      /* ignore */
+    }
+    speakRef.current?.stop?.();
+    setPhase("idle");
+    setMoreComing(false);
+    setBusy(false);
   }, []);
 
   // --- Core send logic (shared by mic and text) --------------------------
@@ -134,26 +181,32 @@ export default function Home() {
       setError("");
       setInput("");
       setBusy(true);
-      setPhase("thinking"); // show the "thinking…" animation until first words
+      setPhase("thinking");
       setMoreComing(false);
+      stoppedRef.current = false;
 
-      // Snapshot history BEFORE adding the new turn.
+      const controller = new AbortController();
+      abortRef.current = controller;
+
       let history;
       setMessages((prev) => {
         history = prev.map((m) => ({ role: m.role, content: m.content }));
         return [
           ...prev,
-          { role: "user", content: text },
-          { role: "assistant", content: "" },
+          { role: "user", content: text, ts: nowTs() },
+          { role: "assistant", content: "", ts: nowTs() },
         ];
       });
 
       const speakOn = voiceRepliesRef.current;
       const selected = LANGUAGES.find((l) => l.code === langRef.current);
       const apiLang = selected?.apiLang || null;
-      const chatOpts = { language: apiLang, webSearch: webSearchRef.current };
+      const chatOpts = {
+        language: apiLang,
+        webSearch: webSearchRef.current,
+        signal: controller.signal,
+      };
 
-      // A queue of sentences waiting to be spoken + revealed in sync.
       const queue = [];
       let queueRunning = false;
       let streamDone = false;
@@ -161,22 +214,16 @@ export default function Home() {
       let resolveWhenDone;
       const allSpoken = new Promise((res) => (resolveWhenDone = res));
 
-      // Reflect whether there's still buffered content the user hasn't seen yet.
-      const refreshMoreComing = () => {
-        setMoreComing(queue.length > 0);
-      };
+      const refreshMoreComing = () => setMoreComing(queue.length > 0);
 
-      // For each sentence: speak it, and reveal its words gradually across the
-      // spoken duration so text and voice move together.
       function runQueue() {
         if (queueRunning) return;
         queueRunning = true;
-
         const step = () => {
-          if (queue.length === 0) {
+          if (stoppedRef.current || queue.length === 0) {
             queueRunning = false;
             setMoreComing(false);
-            if (streamDone) resolveWhenDone?.();
+            if (streamDone || stoppedRef.current) resolveWhenDone?.();
             return;
           }
           const sentence = queue.shift();
@@ -194,20 +241,16 @@ export default function Home() {
           };
 
           setPhase("streaming");
-          speakRef.current(sentence, {
+          speakRef.current.speak(sentence, {
             onStart: () => {
-              // Word-by-word reveal timed to the spoken sentence.
               cancelStream = streamWords(sentence, appendToAssistant, () => {});
             },
             onEnd: () => {
-              // Ensure the full sentence is shown even if timing under/over-ran.
               if (cancelStream) cancelStream();
               advance();
             },
           });
 
-          // Safety net: if speech never starts (TTS unsupported), still reveal
-          // the sentence and move on.
           setTimeout(() => {
             if (!advanced && !cancelStream) {
               appendToAssistant(sentence);
@@ -219,64 +262,74 @@ export default function Home() {
       }
 
       let fullReply = "";
-      let unspokenLen = 0; // chars already pushed into the queue
+      let unspokenLen = 0;
       let sawFirst = false;
       try {
-        await streamChat(text, history, (chunk) => {
-          fullReply += chunk;
+        await streamChat(
+          text,
+          history,
+          (chunk) => {
+            if (stoppedRef.current) return;
+            fullReply += chunk;
 
-          if (!speakOn) {
-            // Voice off: stream text straight to the bubble (fast path).
-            if (!sawFirst) {
-              sawFirst = true;
-              setPhase("streaming");
+            if (!speakOn) {
+              if (!sawFirst) {
+                sawFirst = true;
+                setPhase("streaming");
+              }
+              appendToAssistant(chunk);
+              return;
             }
-            appendToAssistant(chunk);
-            return;
-          }
 
-          // Voice on: hold text back; enqueue only fully-completed sentences.
-          const pending = fullReply.slice(unspokenLen);
-          const match = pending.match(/^[\s\S]*[.!?]/); // up to last sentence end
-          if (match) {
-            const completed = match[0];
-            const sentences = splitIntoSentences(completed);
-            sentences.forEach((s) => queue.push(s));
-            unspokenLen += completed.length;
-            sawFirst = true;
-            refreshMoreComing();
-            runQueue();
-          }
-        }, chatOpts);
+            const pending = fullReply.slice(unspokenLen);
+            const match = pending.match(/^[\s\S]*[.!?]/);
+            if (match) {
+              const completed = match[0];
+              splitIntoSentences(completed).forEach((s) => queue.push(s));
+              unspokenLen += completed.length;
+              sawFirst = true;
+              refreshMoreComing();
+              runQueue();
+            }
+          },
+          chatOpts
+        );
 
-        if (speakOn) {
-          // Flush any trailing text with no ending punctuation.
+        if (speakOn && !stoppedRef.current) {
           const tail = fullReply.slice(unspokenLen).trim();
           if (tail) queue.push(tail);
           streamDone = true;
           refreshMoreComing();
           runQueue();
-          // Wait until every queued sentence has been spoken+shown.
           if (queue.length > 0 || queueRunning) await allSpoken;
         }
       } catch (err) {
-        setError(err.message);
-        setMessages((prev) => {
-          const next = [...prev];
-          if (
-            next.length &&
-            next[next.length - 1].role === "assistant" &&
-            !next[next.length - 1].content
-          ) {
-            next[next.length - 1] = {
-              role: "assistant",
-              content:
-                "⚠️ Sorry, I couldn't get a response. Check the backend connection.",
-            };
-          }
-          return next;
-        });
+        // A user-initiated abort is not an error — just stop quietly.
+        if (err?.name === "AbortError" || stoppedRef.current) {
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant" && !last.content) {
+              next[next.length - 1] = { ...last, content: "⏹ (stopped)" };
+            }
+            return next;
+          });
+        } else {
+          setError(err.message || "Request failed");
+          setMessages((prev) => {
+            const next = [...prev];
+            const last = next[next.length - 1];
+            if (last?.role === "assistant" && !last.content) {
+              next[next.length - 1] = {
+                ...last,
+                content: "⚠️ Sorry, I couldn't get a response. Check the connection.",
+              };
+            }
+            return next;
+          });
+        }
       } finally {
+        abortRef.current = null;
         setBusy(false);
         setPhase("idle");
         setMoreComing(false);
@@ -297,15 +350,14 @@ export default function Home() {
     stopSpeaking,
     primeSpeech,
   } = useSpeech({
-    // When the browser finalizes what the user said, send it.
     onFinalTranscript: (finalText) => submitMessage(finalText),
     language: langCode,
   });
 
-  // Keep the speak ref pointing at the current hook function.
+  // Expose both speak + stop through the ref used inside submitMessage.
   useEffect(() => {
-    speakRef.current = speak;
-  }, [speak]);
+    speakRef.current = { speak, stop: stopSpeaking };
+  }, [speak, stopSpeaking]);
 
   // --- Effects -----------------------------------------------------------
   useEffect(() => {
@@ -319,7 +371,7 @@ export default function Home() {
       top: scrollRef.current.scrollHeight,
       behavior: "smooth",
     });
-  }, [messages, interim]);
+  }, [messages, interim, phase]);
 
   function toggleMic() {
     if (listening) stopListening();
@@ -329,22 +381,34 @@ export default function Home() {
   function toggleVoiceReplies() {
     const next = !voiceReplies;
     setVoiceReplies(next);
-    if (next) {
-      // Turning voice on is a user tap — use it to unlock mobile audio.
-      primeSpeech();
-    } else {
-      stopSpeaking(); // turning off should silence any current speech
+    if (next) primeSpeech();
+    else stopSpeaking();
+  }
+
+  function clearConversation() {
+    stopEverything();
+    setMessages([]);
+    setError("");
+    try {
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {
+      /* ignore */
     }
   }
 
   const modelReady = health?.ollama?.model_present;
+  // Detect the classic HTTPS-page → HTTP-API mixed-content trap.
+  const mixedContent =
+    typeof window !== "undefined" &&
+    window.location.protocol === "https:" &&
+    API_BASE_URL.startsWith("http:");
 
   return (
     <div className="flex flex-1 flex-col items-center bg-zinc-50 dark:bg-black">
       <div className="flex w-full max-w-2xl flex-1 flex-col px-4 py-6">
         {/* Header */}
-        <header className="mb-4 flex items-start justify-between">
-          <div>
+        <header className="mb-4 flex items-start justify-between gap-3">
+          <div className="min-w-0">
             <h1 className="text-2xl font-semibold tracking-tight text-black dark:text-zinc-50">
               AI Audio Support
             </h1>
@@ -353,7 +417,6 @@ export default function Home() {
             </p>
             <StatusBadge health={health} error={error} />
           </div>
-          {/* Controls: language, web search, voice on/off */}
           <div className="mt-1 flex shrink-0 flex-col items-end gap-2">
             <select
               value={langCode}
@@ -367,7 +430,7 @@ export default function Home() {
                 </option>
               ))}
             </select>
-            <div className="flex gap-2">
+            <div className="flex flex-wrap justify-end gap-2">
               <button
                 onClick={() => setWebSearch((v) => !v)}
                 disabled={health && !health.web_search_enabled}
@@ -391,55 +454,88 @@ export default function Home() {
               >
                 {voiceReplies ? "🔊 Voice on" : "🔇 Voice off"}
               </button>
+              <button
+                onClick={clearConversation}
+                disabled={messages.length === 0 && !busy}
+                title="Clear conversation"
+                className="rounded-full border border-black/[.12] px-3 py-1.5 text-sm disabled:opacity-40 dark:border-white/[.15]"
+              >
+                🗑 Clear
+              </button>
             </div>
           </div>
         </header>
+
+        {/* Mixed-content warning (deployed HTTPS site can't call an HTTP API) */}
+        {mixedContent && (
+          <div className="mb-3 rounded-lg border border-amber-400/50 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
+            ⚠️ This page is HTTPS but the API URL is HTTP, so the browser will
+            block requests. Use an HTTPS API URL (e.g. a tunnel) in
+            <code className="mx-1">NEXT_PUBLIC_API_BASE_URL</code>.
+          </div>
+        )}
 
         {/* Messages */}
         <div
           ref={scrollRef}
           className="flex-1 space-y-3 overflow-y-auto rounded-xl border border-black/[.08] bg-white p-4 dark:border-white/[.12] dark:bg-zinc-950"
         >
-          {messages.length === 0 && !interim && (
-            <p className="mt-8 text-center text-sm text-zinc-400">
-              🎤 Tap the mic and ask something — or type below.
-            </p>
+          {messages.length === 0 && !interim && phase === "idle" && (
+            <div className="mt-10 text-center text-sm text-zinc-400">
+              <p className="text-3xl">🎤</p>
+              <p className="mt-2">Tap the mic and ask something — or type below.</p>
+              <p className="mt-1 text-xs">
+                Tip: pick a language, and toggle 🌐 for live web answers.
+              </p>
+            </div>
           )}
           {messages.map((m, i) => {
             const isLastAssistant =
               m.role === "assistant" && i === messages.length - 1;
+            // Skip the empty placeholder assistant bubble — the Thinking bubble
+            // stands in for it, so we don't show two blobs at once.
+            if (m.role === "assistant" && !m.content && isLastAssistant) return null;
             return (
               <Bubble
                 key={i}
                 role={m.role}
                 content={m.content}
-                // On the active assistant bubble, show a "more coming" hint
-                // and a typing caret while streaming.
+                ts={m.ts}
                 moreComing={isLastAssistant && moreComing}
                 streaming={isLastAssistant && phase === "streaming"}
               />
             );
           })}
-          {/* "Thinking…" bubble shown before any words arrive. */}
-          {phase === "thinking" && <ThinkingBubble />}
-          {/* Live transcription of what the user is saying right now. */}
+          {phase === "thinking" && <ThinkingBubble webSearch={webSearch} />}
           {interim && <Bubble role="user" content={interim} ghost />}
         </div>
 
         {/* Mic — the primary control */}
         <div className="mt-5 flex flex-col items-center">
-          <button
-            onClick={toggleMic}
-            disabled={!supported.stt}
-            aria-label={listening ? "Stop listening" : "Start listening"}
-            className={`flex h-20 w-20 items-center justify-center rounded-full text-3xl shadow-lg transition-all disabled:opacity-40 ${
-              listening
-                ? "animate-pulse bg-red-500 text-white ring-4 ring-red-300"
-                : "bg-black text-white hover:scale-105 dark:bg-white dark:text-black"
-            }`}
-          >
-            {listening ? "⏹" : "🎤"}
-          </button>
+          <div className="flex items-center gap-4">
+            <button
+              onClick={toggleMic}
+              disabled={!supported.stt || busy}
+              aria-label={listening ? "Stop listening" : "Start listening"}
+              className={`flex h-20 w-20 items-center justify-center rounded-full text-3xl shadow-lg transition-all disabled:opacity-40 ${
+                listening
+                  ? "animate-pulse bg-red-500 text-white ring-4 ring-red-300"
+                  : "bg-black text-white hover:scale-105 dark:bg-white dark:text-black"
+              }`}
+            >
+              {listening ? "⏹" : "🎤"}
+            </button>
+            {/* Stop button appears only while a reply is in progress. */}
+            {busy && (
+              <button
+                onClick={stopEverything}
+                title="Stop"
+                className="flex h-12 w-12 items-center justify-center rounded-full bg-red-100 text-red-600 hover:bg-red-200 dark:bg-red-950 dark:text-red-400"
+              >
+                ⏹
+              </button>
+            )}
+          </div>
           <div className="mt-2 flex h-5 items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
             {!supported.stt ? (
               "Mic not supported in this browser — try Chrome/Edge"
@@ -448,7 +544,7 @@ export default function Home() {
             ) : phase === "thinking" ? (
               <>
                 Thinking
-                <span className="inline-flex gap-1 text-zinc-500 dark:text-zinc-400">
+                <span className="inline-flex gap-1">
                   <span className="dot" />
                   <span className="dot" />
                   <span className="dot" />
@@ -457,7 +553,7 @@ export default function Home() {
             ) : speaking || phase === "streaming" ? (
               <>
                 Answering
-                <span className="inline-flex items-end gap-0.5 text-zinc-500 dark:text-zinc-400">
+                <span className="inline-flex items-end gap-0.5">
                   <span className="eq-bar" />
                   <span className="eq-bar" />
                   <span className="eq-bar" />
@@ -499,10 +595,31 @@ export default function Home() {
   );
 }
 
-function Bubble({ role, content, ghost, moreComing, streaming }) {
+function formatTime(ts) {
+  if (!ts) return "";
+  try {
+    return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
+function Bubble({ role, content, ghost, moreComing, streaming, ts }) {
   const isUser = role === "user";
+  const [copied, setCopied] = useState(false);
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {
+      /* clipboard may be blocked; ignore */
+    }
+  };
+
   return (
-    <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+    <div className={`group flex flex-col ${isUser ? "items-end" : "items-start"}`}>
       <div
         className={`max-w-[80%] whitespace-pre-wrap rounded-2xl px-4 py-2 text-sm ${
           isUser
@@ -513,13 +630,11 @@ function Bubble({ role, content, ghost, moreComing, streaming }) {
         {content ? (
           <>
             {content}
-            {/* Blinking caret while text is actively streaming in. */}
             {streaming && <span className="caret" />}
           </>
         ) : (
           <span className="opacity-40">…</span>
         )}
-        {/* "More is coming" indicator for the active reply. */}
         {moreComing && (
           <span
             className="ml-2 inline-flex gap-1 align-middle text-zinc-500 dark:text-zinc-400"
@@ -531,19 +646,33 @@ function Bubble({ role, content, ghost, moreComing, streaming }) {
           </span>
         )}
       </div>
+      {/* Meta row: timestamp + copy (copy only for real, non-ghost content). */}
+      {!ghost && content && (
+        <div
+          className={`mt-0.5 flex items-center gap-2 px-1 text-[10px] text-zinc-400 opacity-0 transition-opacity group-hover:opacity-100 ${
+            isUser ? "flex-row-reverse" : ""
+          }`}
+        >
+          <span>{formatTime(ts)}</span>
+          <button onClick={copy} className="hover:text-zinc-600 dark:hover:text-zinc-200">
+            {copied ? "copied ✓" : "copy"}
+          </button>
+        </div>
+      )}
     </div>
   );
 }
 
-// A standalone assistant bubble that shows only the "thinking" animation,
-// used before the first words of the reply arrive.
-function ThinkingBubble() {
+function ThinkingBubble({ webSearch }) {
   return (
-    <div className="flex justify-start">
-      <div className="flex items-center gap-1 rounded-2xl bg-zinc-100 px-4 py-3 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
-        <span className="dot" />
-        <span className="dot" />
-        <span className="dot" />
+    <div className="flex flex-col items-start">
+      <div className="flex items-center gap-2 rounded-2xl bg-zinc-100 px-4 py-3 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
+        <span className="inline-flex gap-1">
+          <span className="dot" />
+          <span className="dot" />
+          <span className="dot" />
+        </span>
+        {webSearch && <span className="text-xs">searching the web…</span>}
       </div>
     </div>
   );
