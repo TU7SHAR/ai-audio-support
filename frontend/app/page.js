@@ -122,6 +122,7 @@ export default function Home() {
     stopListening,
     speak,
     stopSpeaking,
+    primeSpeech,
   } = useSpeech({
     // When the browser finalizes what the user said, send it.
     onFinalTranscript: (finalText) => submitMessage(finalText),
@@ -154,7 +155,12 @@ export default function Home() {
   function toggleVoiceReplies() {
     const next = !voiceReplies;
     setVoiceReplies(next);
-    if (!next) stopSpeaking(); // turning off should silence any current speech
+    if (next) {
+      // Turning voice on is a user tap — use it to unlock mobile audio.
+      primeSpeech();
+    } else {
+      stopSpeaking(); // turning off should silence any current speech
+    }
   }
 
   const modelReady = health?.ollama?.model_present;
