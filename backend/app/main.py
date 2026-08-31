@@ -9,12 +9,19 @@ Features:
   - Multi-language: pass `language` to have the model reply in that language.
   - Web search: pass `web_search: true` to fetch live Brave results and answer
     from them (requires BRAVE_API_KEY; otherwise it's silently skipped).
+  - Context management: history is trimmed to a recent window before sending.
+  - Efficiency: shared HTTP client, warm model (keep_alive), a concurrency guard
+    so the CPU-only model isn't overwhelmed by simultaneous requests.
 
 Endpoints:
   GET  /health        -> service + Ollama + web-search status
-  POST /chat          -> {reply} for a single message (waits for full answer)
-  POST /chat/stream   -> streams the reply token-by-token (for real-time voice)
+  POST /chat          -> {reply, citations} for a single message
+  POST /chat/stream   -> streams the reply token-by-token; citations via header
 """
+
+import asyncio
+import json
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,13 +29,28 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .config import settings
-from .ollama_client import check_ollama, generate_reply, stream_reply
-from .web_search import brave_search, format_results_for_prompt
+from .ollama_client import check_ollama, close_client, generate_reply, stream_reply
+from .web_search import brave_search, format_results_for_prompt, to_citations
+
+
+# The CPU-only model realistically handles one generation at a time. This
+# semaphore serializes heavy work so concurrent callers queue instead of
+# thrashing the CPU (each waits its turn rather than all slowing to a crawl).
+_gen_semaphore = asyncio.Semaphore(1)
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    # Clean up the shared HTTP client on shutdown.
+    await close_client()
+
 
 app = FastAPI(
     title="AI Audio Support API",
     description="Text-in / text-out support agent backed by local Ollama + Qwen.",
-    version="0.2.0",
+    version="0.3.0",
+    lifespan=lifespan,
 )
 
 # Allow the browser frontend (Vercel) to call this API.
@@ -41,6 +63,8 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Expose our custom header so the browser can read citations from streaming.
+    expose_headers=["X-Citations", "X-Used-Web-Search"],
 )
 
 
@@ -67,21 +91,31 @@ class ChatRequest(BaseModel):
     )
 
 
+class Citation(BaseModel):
+    n: int
+    title: str
+    url: str
+
+
 class ChatResponse(BaseModel):
     reply: str
     model: str
     used_web_search: bool = False
+    citations: list[Citation] = []
 
 
 # --- Helpers ---------------------------------------------------------------
-async def _maybe_search(req: ChatRequest) -> tuple[str | None, bool]:
-    """Run web search if requested and enabled. Returns (context, used)."""
+async def _maybe_search(req: ChatRequest):
+    """Run web search if requested and enabled.
+
+    Returns (context_text, used, citations).
+    """
     if not req.web_search or not settings.web_search_enabled:
-        return None, False
+        return None, False, []
     results = await brave_search(req.message)
     if not results:
-        return None, False
-    return format_results_for_prompt(results), True
+        return None, False, []
+    return format_results_for_prompt(results), True, to_citations(results)
 
 
 # --- Routes ----------------------------------------------------------------
@@ -94,6 +128,8 @@ async def health():
         "model": settings.ollama_model,
         "ollama": ollama,
         "web_search_enabled": settings.web_search_enabled,
+        "num_ctx": settings.num_ctx,
+        "max_history_turns": settings.max_history_turns,
     }
 
 
@@ -101,24 +137,38 @@ async def health():
 async def chat(req: ChatRequest):
     """Return the full reply for a single message (blocks until complete)."""
     history = [t.model_dump() for t in req.history] if req.history else None
-    search_context, used = await _maybe_search(req)
-    reply = await generate_reply(req.message, history, req.language, search_context)
-    return ChatResponse(reply=reply, model=settings.ollama_model, used_web_search=used)
+    search_context, used, citations = await _maybe_search(req)
+    async with _gen_semaphore:
+        reply = await generate_reply(req.message, history, req.language, search_context)
+    return ChatResponse(
+        reply=reply,
+        model=settings.ollama_model,
+        used_web_search=used,
+        citations=citations,
+    )
 
 
 @app.post("/chat/stream")
 async def chat_stream(req: ChatRequest):
     """Stream the reply as plain-text chunks.
 
-    The frontend reads this incrementally so it can start speaking sooner.
-    When web search is used, the results are fetched first (this adds a short
-    delay before the first token), then the answer streams normally.
+    Web search (if any) runs first, then tokens stream. Citations are returned
+    in the `X-Citations` response header (JSON), since the body is plain text.
     """
     history = [t.model_dump() for t in req.history] if req.history else None
-    search_context, _used = await _maybe_search(req)
+    search_context, used, citations = await _maybe_search(req)
 
     async def token_generator():
-        async for chunk in stream_reply(req.message, history, req.language, search_context):
-            yield chunk
+        async with _gen_semaphore:
+            async for chunk in stream_reply(
+                req.message, history, req.language, search_context
+            ):
+                yield chunk
 
-    return StreamingResponse(token_generator(), media_type="text/plain; charset=utf-8")
+    headers = {
+        "X-Used-Web-Search": "1" if used else "0",
+        "X-Citations": json.dumps(citations),
+    }
+    return StreamingResponse(
+        token_generator(), media_type="text/plain; charset=utf-8", headers=headers
+    )

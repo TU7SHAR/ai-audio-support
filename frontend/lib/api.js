@@ -64,6 +64,19 @@ export async function streamChat(message, history = [], onChunk, opts = {}) {
     throw new Error(`API error ${res.status}: ${detail || res.statusText}`);
   }
 
+  // Web-search citations (if any) come back in a response header, since the
+  // body is plain streamed text.
+  let citations = [];
+  let usedWebSearch = false;
+  try {
+    usedWebSearch = res.headers.get("X-Used-Web-Search") === "1";
+    const raw = res.headers.get("X-Citations");
+    if (raw) citations = JSON.parse(raw);
+  } catch {
+    /* ignore malformed header */
+  }
+  if (opts.onMeta) opts.onMeta({ citations, usedWebSearch });
+
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let full = "";
@@ -75,7 +88,7 @@ export async function streamChat(message, history = [], onChunk, opts = {}) {
     full += chunk;
     if (onChunk) onChunk(chunk);
   }
-  return full;
+  return { text: full, citations, usedWebSearch };
 }
 
 /** Check backend + model health. */
