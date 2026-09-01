@@ -35,6 +35,12 @@ Each folder has its own README with setup and deploy instructions:
 - [`frontend/README.md`](./frontend/README.md)
 - [`backend/README.md`](./backend/README.md)
 
+## Documentation
+
+Deeper project documentation — architecture, per-service details, the
+conversation-memory analysis, roadmap, and decision records — lives in
+[`docs/`](./docs/README.md). Start at [`docs/README.md`](./docs/README.md).
+
 ## Quick start (local)
 
 **1. Backend** (needs Ollama + a pulled model):
