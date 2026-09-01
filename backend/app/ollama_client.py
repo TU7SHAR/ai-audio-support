@@ -47,6 +47,46 @@ def _language_instruction(language: str | None) -> str:
     return f"Reply ONLY in {name}. The user prefers {name}."
 
 
+def _trim_history(history: list[dict] | None) -> list[dict]:
+    """Bound how much conversation history is replayed into the prompt.
+
+    The client sends the full history on every request. Replaying all of it is
+    unbounded and, on a small CPU-only model, both slows each turn and risks
+    overflowing the context window (Ollama then silently truncates from the
+    front). We keep the conversation predictable by:
+
+      1. dropping empty/invalid turns,
+      2. keeping only the last `max_history_turns` turns (0 = no turn limit),
+      3. then trimming from the OLDEST kept turn until the total character
+         count is under `max_history_chars` (0 = no char limit).
+
+    The system prompt is added separately in `_build_messages` and is never
+    subject to this trimming, so it is always preserved.
+    """
+    if not history:
+        return []
+
+    # 1. Keep only well-formed user/assistant turns with actual content.
+    clean: list[dict] = [
+        {"role": t.get("role"), "content": t.get("content", "")}
+        for t in history
+        if t.get("role") in ("user", "assistant") and t.get("content", "").strip()
+    ]
+
+    # 2. Turn-count cap: keep the most recent turns.
+    if settings.max_history_turns and len(clean) > settings.max_history_turns:
+        clean = clean[-settings.max_history_turns :]
+
+    # 3. Character-budget cap: drop from the oldest until under budget.
+    if settings.max_history_chars:
+        total = sum(len(t["content"]) for t in clean)
+        while clean and total > settings.max_history_chars:
+            dropped = clean.pop(0)
+            total -= len(dropped["content"])
+
+    return clean
+
+
 def _build_messages(
     user_text: str,
     history: list[dict] | None,
@@ -56,7 +96,7 @@ def _build_messages(
     """Assemble the chat message list Ollama expects.
 
     Structure: a system prompt (plus optional language + search instructions),
-    then prior turns, then the new user message.
+    then a BOUNDED window of prior turns, then the new user message.
     """
     system = settings.system_prompt
     lang_hint = _language_instruction(language)
@@ -65,12 +105,8 @@ def _build_messages(
 
     messages: list[dict] = [{"role": "system", "content": system}]
 
-    if history:
-        for turn in history:
-            role = turn.get("role")
-            content = turn.get("content", "")
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
+    for turn in _trim_history(history):
+        messages.append({"role": turn["role"], "content": turn["content"]})
 
     # If we have live search results, prepend them to the user's message so the
     # model answers from real data rather than guessing.

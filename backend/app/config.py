@@ -39,6 +39,24 @@ class Settings(BaseSettings):
     # Sampling temperature: lower = more focused/consistent answers.
     temperature: float = 0.4
 
+    # --- Conversation memory (context-window management) -------------------
+    # The client sends the full conversation history on every request. On a
+    # small model (qwen2.5:3b) running CPU-only, replaying an unbounded history
+    # makes each turn slower and eventually overflows the context window (which
+    # causes Ollama to silently truncate from the front, dropping the system
+    # prompt and earliest turns unpredictably).
+    #
+    # To keep latency stable and behaviour predictable we bound how much history
+    # is replayed into the prompt. The system prompt is ALWAYS kept; we drop the
+    # OLDEST history turns first.
+    #
+    # A "turn" is one message (either a user or an assistant message).
+    #   - max_history_turns: hard cap on how many recent turns to keep.
+    #   - max_history_chars: soft cap on the total characters across kept turns
+    #     (a cheap proxy for tokens). Set either to 0 to disable that limit.
+    max_history_turns: int = 12
+    max_history_chars: int = 6000
+
     # --- Web search (Brave Search API) ------------------------------------
     # Optional. If a key is set, the /chat endpoints can fetch live web results
     # and feed them to the model. Get a free key at:
