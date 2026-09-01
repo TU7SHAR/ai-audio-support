@@ -51,7 +51,7 @@ Each entry captures:
   context-window truncation of the system prompt/earliest turns. This is memory
   plan step #1; summarization (#2), real sessions (#3), and history validation
   (#4) remain.
-- **PR:** _(to be filled in after opening — new PR for this change)_
+- **PR:** #10 — https://github.com/TU7SHAR/ai-audio-support/pull/10
 
 ---
 
