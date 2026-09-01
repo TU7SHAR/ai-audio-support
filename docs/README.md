@@ -20,6 +20,10 @@ re-reading the entire codebase.
 | [`roadmap.md`](./roadmap.md) | Milestones, what's done, what's next |
 | [`decisions.md`](./decisions.md) | Architecture Decision Records (ADRs) — the "why" behind choices |
 | [`operations.md`](./operations.md) | Running, deploying, tunnels, common gotchas |
+| [`agent-activity-log.md`](./agent-activity-log.md) | Running log of every AI-agent change: asked vs. interpreted, what changed, files affected, impact, PR |
+
+See also the [`commands/`](../commands/README.md) folder — a quick-reference for
+what each command and file does.
 
 ## Quick facts
 

@@ -1,11 +1,27 @@
 # Conversation Memory & Session Management
 
-> Status: **basic and functional, but not optimized.** This doc records exactly
-> how memory works today, the gaps, and the prioritized plan to improve it.
+> Status: **bounded history implemented (plan #1 done); summarization + real
+> sessions still pending.** This doc records how memory works, the gaps, and the
+> prioritized plan to improve it.
+
+## ✅ Implemented: server-side bounded history (plan #1)
+
+The backend no longer replays the *entire* history into the prompt. In
+`ollama_client._trim_history` it now:
+1. drops empty/invalid turns,
+2. keeps only the last `MAX_HISTORY_TURNS` turns (default **12**),
+3. then trims from the **oldest** kept turn until total characters are under
+   `MAX_HISTORY_CHARS` (default **6000**).
+
+The **system prompt is always preserved** (added separately, never trimmed).
+Both limits are configurable in `.env`; setting either to `0` disables it.
+This fixes the latency-growth and silent-truncation risks below. See the
+[backend config](./backend.md#configuration-env-see-envexample).
 
 ## How it works today
 
-Memory is **entirely client-side and unbounded on the prompt**:
+Memory is still **held by the client** (localStorage) and sent on every request,
+but the **prompt is now bounded server-side**:
 
 1. `app/page.js` keeps `messages` in React state, persisted to `localStorage`
    (capped at the **last 100 messages** — a UI cap, not a prompt cap).
@@ -21,14 +37,10 @@ sessions**, **no server-side memory**, and **no context-window management**.
 
 ## Gaps (in priority order)
 
-### 1. No token / context-window management  ← highest impact
-The backend replays the *entire* history every turn. On a CPU-only box with
-`qwen2.5:3b`'s limited context window this means:
-- Latency climbs turn-over-turn (worse time-to-first-token).
-- Eventually the context window overflows and Ollama **silently truncates from
-  the front** — the model forgets the system prompt and earliest turns
-  unpredictably.
-- The 100-message localStorage cap would blow the window long before it's hit.
+### 1. ~~No token / context-window management~~ ✅ DONE
+Previously the backend replayed the *entire* history every turn, which grew
+latency and risked silent context-window truncation. **Now bounded** via
+`MAX_HISTORY_TURNS` + `MAX_HISTORY_CHARS` (see the Implemented section above).
 
 ### 2. No real session identity
 Memory lives only in one browser's localStorage. Different device = amnesia.
@@ -49,30 +61,21 @@ No server-side cap on history length or on individual message size.
 
 ## Verdict
 
-For a **working prototype it's acceptable** — memory functions and survives
-refresh. As **"optimized session management" the piece is essentially missing.**
-The critical gap is #1 (server-side context management); the rest are maturity
-steps beyond it.
+The **critical gap (#1, context-window management) is now fixed.** Memory
+functions, survives refresh, and the prompt is bounded and predictable. The
+remaining items (real sessions, summarization, validation) are maturity steps.
 
 ## Improvement plan
 
-| # | Change | Impact | Effort | Where |
-|---|--------|--------|--------|-------|
-| 1 | **Bounded history** — cap replayed turns to last N and/or a token/char budget, always keeping the system prompt | High (fixes latency growth + silent truncation) | Low (~20 lines) | `config.py`, `ollama_client.py` |
-| 2 | **Rolling summarization** — summarize older turns into one compact note, keep recent turns verbatim | High (best memory-vs-cost tradeoff) | Medium | `ollama_client.py` (+ a summarize call) |
-| 3 | **Real sessions** — `session_id` + server-side store (in-memory/SQLite); client sends the id | Medium (resume, multi-device, transcripts) | Medium–High | new module + `main.py` |
-| 4 | **Validate/limit incoming history** — length caps, drop empty/oversized turns | Medium (safety) | Low | `main.py` |
+| # | Change | Impact | Effort | Where | Status |
+|---|--------|--------|--------|-------|--------|
+| 1 | **Bounded history** — cap replayed turns and/or char budget, always keep system prompt | High (fixes latency growth + silent truncation) | Low | `config.py`, `ollama_client.py` | ✅ done |
+| 2 | **Rolling summarization** — summarize older turns into one compact note, keep recent turns verbatim | High (best memory-vs-cost tradeoff) | Medium | `ollama_client.py` (+ a summarize call) | ⏳ next |
+| 3 | **Real sessions** — `session_id` + server-side store (in-memory/SQLite); client sends the id | Medium (resume, multi-device, transcripts) | Medium–High | new module + `main.py` | ⏳ |
+| 4 | **Validate/limit incoming history** — length caps, drop empty/oversized turns | Medium (safety) | Low | `main.py` | ⏳ (partly covered: `_trim_history` already drops empty/invalid turns) |
 
-**Recommended start:** #1. It's the change that most directly improves the live
-system's speed and reliability, and it's small and safe. Then #2 for quality,
-#3 for real product features, #4 alongside for hardening.
-
-### Sketch for #1 (bounded history)
-- Add `MAX_HISTORY_TURNS` (e.g. 8) and optionally `MAX_HISTORY_CHARS` to
-  `config.py`.
-- In `_build_messages`, after the system prompt, keep only the last
-  `MAX_HISTORY_TURNS` turns (or trim oldest until under the char/token budget).
-- Never drop the system prompt; drop from the **oldest** history first.
+**Recommended next:** #2 (summarization) for answer quality on longer chats,
+then #3 for real product features.
 
 ## Related decisions
 See [`decisions.md`](./decisions.md) — ADR on statelessness and the memory

@@ -48,7 +48,19 @@ CPU box (latency growth, silent context-window truncation), there are no real
 sessions (no multi-device/resume), and client-supplied history is trusted
 blindly. See [`conversation-memory.md`](./conversation-memory.md) for the plan to
 add bounded history → summarization → real sessions.
-**Status:** ⏳ planned to change, starting with server-side bounded history.
+**Status:** 🔄 in progress. Step 1 done — server-side **bounded history**
+(`MAX_HISTORY_TURNS` + `MAX_HISTORY_CHARS`, system prompt always kept). Sessions
+and summarization still pending.
+
+## ADR-008 — Bound replayed history server-side (not client-side)
+**Decision:** the backend caps how much history it replays into the prompt
+(`_trim_history`: turn cap, then char budget, oldest dropped first), rather than
+relying on the client to limit it.
+**Why:** the client can't be trusted to protect the model's context window, and
+the backend owns prompt construction. Keeping it server-side guarantees the
+system prompt survives and latency stays bounded regardless of client behaviour.
+**Trade-off:** older turns fall out of context (mitigated later by summarization,
+plan #2). Limits are configurable; `0` disables them.
 
 ## ADR-007 — Optional web search via Brave Search API
 **Decision:** when `web_search` is on and a `BRAVE_API_KEY` is set, fetch live

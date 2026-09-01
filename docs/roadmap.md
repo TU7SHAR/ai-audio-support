@@ -13,13 +13,12 @@
 
 ## Next 🔜 (prioritized)
 
-### 1. Conversation memory / session management  ← current focus
-The biggest correctness/performance gap. See
-[`conversation-memory.md`](./conversation-memory.md) for the full plan.
-- [ ] **Bounded history** (cap replayed turns / token budget) — highest impact, lowest effort.
-- [ ] **Rolling summarization** of older turns.
+### 1. Conversation memory / session management  ← in progress
+See [`conversation-memory.md`](./conversation-memory.md) for the full plan.
+- [x] **Bounded history** (cap replayed turns + char budget, keep system prompt) — done.
+- [ ] **Rolling summarization** of older turns.  ← next
 - [ ] **Real server-side sessions** (`session_id` + store).
-- [ ] **Validate/limit incoming history** (safety).
+- [ ] **Validate/limit incoming history** (safety) — partly covered by `_trim_history`.
 
 ### 2. Stream endpoint parity
 - [ ] Have `/chat/stream` signal whether web search was actually used, so the UI
